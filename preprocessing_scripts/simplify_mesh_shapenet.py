@@ -6,6 +6,7 @@ import trimesh
 import numpy as np
 import gc
 import pymeshlab as ml
+import traceback
 
 parser = argparse.ArgumentParser(description='Copy meshes data.')
 parser.add_argument('--in_path', type=str,
@@ -72,6 +73,7 @@ for item in cur_chunk:
         mesh.export(out_path)
         print("Done. \n=====\n")
     except:
+        traceback.print_exc()
         print('\n\n\n============')
         print(f"Failed to simplify mesh {file_name}")
 
