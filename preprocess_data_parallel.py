@@ -46,7 +46,7 @@ def create_chunks(all_ids, chunk_size):
     logger.info(f"Created {len(chunks)} chunks with chunk_size={chunk_size}")
     return chunks
 
-def run_preprocessing_step(step_name, script_path, chunk_id, args_dict):
+def run_preprocessing_step(step_name, script_path, chunk_id, args_dict, show_output=True):
     """Run a single preprocessing step for a specific chunk."""
     try:
         # Build command arguments
@@ -62,27 +62,62 @@ def run_preprocessing_step(step_name, script_path, chunk_id, args_dict):
             elif not isinstance(value, bool):
                 cmd_args.extend([f'--{key}', str(value)])
         
-        logger.debug(f"Running {step_name} chunk {chunk_id}: {' '.join(cmd_args)}")
+        logger.info(f"Starting {step_name} chunk {chunk_id}")
+        logger.debug(f"Command: {' '.join(cmd_args)}")
         
-        # Run the command
-        result = subprocess.run(
-            cmd_args,
-            capture_output=True,
-            text=True,
-            timeout=3600  # 1 hour timeout per chunk
-        )
+        if show_output:
+            # Run with real-time output
+            with subprocess.Popen(
+                cmd_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            ) as process:
+                
+                output_lines = []
+                for line in process.stdout:
+                    line = line.rstrip()
+                    if line:  # Only log non-empty lines
+                        # Prefix each line with step and chunk info
+                        prefixed_line = f"[{step_name}-{chunk_id}] {line}"
+                        logger.info(prefixed_line)
+                        output_lines.append(line)
+                
+                # Wait for process to complete
+                process.wait(timeout=3600)  # 1 hour timeout
+                
+                if process.returncode != 0:
+                    error_msg = f"{step_name} chunk {chunk_id} failed with return code {process.returncode}"
+                    logger.error(error_msg)
+                    # Show last few lines of output for context
+                    if output_lines:
+                        logger.error("Last 10 lines of output:")
+                        for line in output_lines[-10:]:
+                            logger.error(f"  {line}")
+                    return False, chunk_id, error_msg
+        else:
+            # Run without showing output (fallback mode)
+            result = subprocess.run(
+                cmd_args,
+                capture_output=True,
+                text=True,
+                timeout=3600
+            )
+            
+            if result.returncode != 0:
+                error_msg = f"{step_name} chunk {chunk_id} failed with return code {result.returncode}"
+                logger.error(error_msg)
+                logger.error(f"STDOUT: {result.stdout}")
+                logger.error(f"STDERR: {result.stderr}")
+                return False, chunk_id, error_msg
         
-        if result.returncode != 0:
-            error_msg = f"{step_name} chunk {chunk_id} failed with return code {result.returncode}"
-            logger.error(error_msg)
-            logger.error(f"STDERR: {result.stderr}")
-            return False, chunk_id, error_msg
-        
-        logger.debug(f"{step_name} chunk {chunk_id} completed successfully")
+        logger.info(f"✓ {step_name} chunk {chunk_id} completed successfully")
         return True, chunk_id, None
         
     except subprocess.TimeoutExpired:
-        error_msg = f"{step_name} chunk {chunk_id} timed out"
+        error_msg = f"{step_name} chunk {chunk_id} timed out after 1 hour"
         logger.error(error_msg)
         return False, chunk_id, error_msg
     except Exception as e:
@@ -90,7 +125,7 @@ def run_preprocessing_step(step_name, script_path, chunk_id, args_dict):
         logger.error(error_msg)
         return False, chunk_id, error_msg
 
-def run_step_parallel(step_name, script_name, num_chunks, max_workers, base_args):
+def run_step_parallel(step_name, script_name, num_chunks, max_workers, base_args, show_output=True):
     """Run a preprocessing step in parallel across all chunks."""
     logger.info(f"Starting {step_name} with {num_chunks} chunks using {max_workers} workers")
     
@@ -105,22 +140,24 @@ def run_step_parallel(step_name, script_name, num_chunks, max_workers, base_args
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit all chunks
         future_to_chunk = {
-            executor.submit(run_preprocessing_step, step_name, str(script_path), chunk_id, base_args): chunk_id
+            executor.submit(run_preprocessing_step, step_name, str(script_path), chunk_id, base_args, show_output): chunk_id
             for chunk_id in range(num_chunks)
         }
         
         # Process results with progress bar
-        with tqdm(total=num_chunks, desc=f"{step_name} chunks") as pbar:
+        with tqdm(total=num_chunks, desc=f"{step_name} chunks", position=0, leave=True) as pbar:
             for future in as_completed(future_to_chunk):
                 chunk_id = future_to_chunk[future]
                 try:
                     success, returned_chunk_id, error = future.result()
                     if success:
                         successful += 1
+                        pbar.set_description(f"{step_name} chunks (✓ {successful})")
                     else:
                         failed += 1
                         failed_chunks.append(returned_chunk_id)
                         logger.warning(f"{step_name} chunk {returned_chunk_id} failed: {error}")
+                        pbar.set_description(f"{step_name} chunks (✗ {failed})")
                 except Exception as e:
                     failed += 1
                     failed_chunks.append(chunk_id)
@@ -132,7 +169,7 @@ def run_step_parallel(step_name, script_name, num_chunks, max_workers, base_args
     if failed > 0:
         logger.warning(f"{step_name} completed with {failed} failed chunks: {failed_chunks}")
     else:
-        logger.info(f"{step_name} completed successfully (all {successful} chunks)")
+        logger.info(f"✓ {step_name} completed successfully (all {successful} chunks)")
     
     return successful, failed, failed_chunks
 
@@ -151,6 +188,14 @@ def main():
                        help='Maximum number of parallel workers')
     parser.add_argument('--chunk_size', type=int, default=10,
                        help='Number of files per chunk')
+    
+    # Output control
+    parser.add_argument('--quiet', action='store_true',
+                       help='Suppress subprocess output (only show errors)')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose logging (debug level)')
+    parser.add_argument('--log_file', type=str, default=None,
+                       help='Save logs to file in addition to console')
     
     # Step selection
     parser.add_argument('--skip_simplification', action='store_true',
@@ -189,6 +234,25 @@ def main():
     
     args = parser.parse_args()
     
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    log_format = '%(asctime)s - %(levelname)s - %(message)s'
+    
+    # Set up handlers
+    handlers = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file))
+    
+    logging.basicConfig(
+        level=log_level,
+        format=log_format,
+        handlers=handlers,
+        force=True  # Override the basic config set at module level
+    )
+    
+    # Show subprocess output unless --quiet is specified
+    show_subprocess_output = not args.quiet
+    
     # Validate paths
     data_path = Path(args.data_path)
     if not data_path.exists():
@@ -214,7 +278,14 @@ def main():
         logger.error(f"Error discovering mesh files: {e}")
         return
     
-    logger.info(f"Processing pipeline with {args.max_workers} workers")
+    logger.info(f"=== GEM3D Parallel Preprocessing Pipeline ===")
+    logger.info(f"Data path: {data_path}")
+    logger.info(f"Workers: {args.max_workers}")
+    logger.info(f"Chunk size: {args.chunk_size}")
+    logger.info(f"Subprocess output: {'Hidden' if args.quiet else 'Shown'}")
+    if args.log_file:
+        logger.info(f"Log file: {args.log_file}")
+    logger.info(f"===============================================")
     
     # Step 1: Mesh Simplification
     if not args.skip_simplification:
@@ -233,7 +304,8 @@ def main():
             "simplify_mesh_shapenet.py",
             num_chunks, 
             args.max_workers,
-            simplify_args
+            simplify_args,
+            show_subprocess_output
         )
         
         if failed > 0:
@@ -257,7 +329,8 @@ def main():
             "generate_skeletons_shapenet.py",
             num_chunks,
             args.max_workers,
-            skeleton_args
+            skeleton_args,
+            show_subprocess_output
         )
         
         if failed > 0:
@@ -316,7 +389,8 @@ def main():
                     script_name,
                     num_chunks,
                     args.max_workers // len(remaining_steps) + 1,  # Distribute workers
-                    step_args
+                    step_args,
+                    show_subprocess_output
                 )
                 future_to_step[future] = step_name
             
