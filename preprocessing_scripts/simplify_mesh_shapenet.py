@@ -64,7 +64,7 @@ for item in cur_chunk:
     try:
         ms = ml.MeshSet()
         ms.load_new_mesh(file_name)
-        ms.apply_filter('simplification_quadric_edge_collapse_decimation', **filter_params)
+        ms.apply_filter('meshing_decimation_quadric_edge_collapse', **filter_params)
         mesh = ms.mesh(0)
         mesh = trimesh.Trimesh(vertices=mesh.vertex_matrix(), faces=mesh.face_matrix())
         print(f'Simplified mesh is watertight {mesh.is_watertight}')
